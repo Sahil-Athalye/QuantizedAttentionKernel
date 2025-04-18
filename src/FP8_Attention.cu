@@ -341,10 +341,9 @@ __global__ void fp8_flash_attention_kernel(
 void compute_quant_params(const half* query, const half* key, 
                          int batch_size, int num_heads, int seq_len, int head_dim,
                          QuantParams& params) {
-    // In practice, you would determine these dynamically by analyzing the data
-    // This is a simplified example
-    params.scale_q = 10.0f;  // Example scale, should be determined by data range
-    params.scale_k = 10.0f;  // Example scale, should be determined by data range
+
+    params.scale_q = 10.0f;  // the scale should be determined by data range of the actuall llm embedding
+    params.scale_k = 10.0f;  
     params.scale_qk = params.scale_q * params.scale_k;
 }
 
