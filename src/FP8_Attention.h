@@ -10,12 +10,15 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <cfloat> 
 #include <cmath>
 #include <vector>
 #include <iostream>
 #include <iomanip>
 #include "quantize.h"
-#include <random>   
+#include <random> 
+#include "../../cuda-code-repo-Sahil-Athalye/libgputk/gputk.h"
 
 
 // Define block size parameters - tuned for specific hardware

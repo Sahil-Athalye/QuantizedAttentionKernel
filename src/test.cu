@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 
+
 int main(int argc, char **argv) {
   // Default parameters
   int batch_size = 1;
@@ -10,6 +11,12 @@ int main(int argc, char **argv) {
   int head_dim   = 8;
   float range    = 1.0f;
   unsigned seed  = 0;
+
+  // Define timing variables
+  cudaEvent_t start, stop;
+  float milliseconds = 0;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
 
   // Parse command-line args
   for (int i = 1; i < argc; ++i) {
@@ -73,11 +80,15 @@ int main(int argc, char **argv) {
   cudaMalloc(&d_v, bytes);
   cudaMalloc(&d_out, bytes);
 
+  cudaEventRecord(start);
   cudaMemcpy(d_q, h_query.data(), bytes, cudaMemcpyHostToDevice);
   cudaMemcpy(d_k, h_key.data(), bytes, cudaMemcpyHostToDevice);
   cudaMemcpy(d_v, h_value.data(), bytes, cudaMemcpyHostToDevice);
   cudaMemset(d_out, 0, bytes);
-
+  cudaEventRecord(stop);
+  cudaEventSynchronize(stop);
+  cudaEventElapsedTime(&milliseconds, start, stop);
+  std::cout << "Time to copy data to GPU: " << milliseconds << " ms" << std::endl;
   //   // allocate refernce gpu memory
   //   cudaMalloc(&d_r_q, bytes_full);
   //   cudaMalloc(&d_r_k, bytes_full);
@@ -90,11 +101,23 @@ int main(int argc, char **argv) {
   //   h_r_value.data(), bytes_full, cudaMemcpyHostToDevice);
   //   cudaMemset(d_r_out, 0, bytes_full);
 
+  
   // Run GPU kernel
+  cudaEventRecord(start);
   fp8_quantized_attention(d_q, d_k, d_v, d_out, batch_size, num_heads,
                           seq_len, head_dim);
   cudaDeviceSynchronize();
+  cudaEventRecord(stop);
+  cudaEventSynchronize(stop);
+  cudaEventElapsedTime(&milliseconds, start, stop);
+  std::cout << "FP8 kernel execution time: " << milliseconds << " ms" << std::endl;
+
+  cudaEventRecord(start);
   cudaMemcpy(h_out_gpu.data(), d_out, bytes, cudaMemcpyDeviceToHost);
+  cudaEventRecord(stop);
+  cudaEventSynchronize(stop);
+  cudaEventElapsedTime(&milliseconds, start, stop);
+  std::cout << "Time to copy results back to CPU: " << milliseconds << " ms" << std::endl;
 
   // Run CPU reference
   reference_attention(h_r_query.data(), h_r_key.data(), h_r_value.data(),
@@ -129,5 +152,7 @@ int main(int argc, char **argv) {
   cudaFree(d_k);
   cudaFree(d_v);
   cudaFree(d_out);
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
   return 0;
 }
