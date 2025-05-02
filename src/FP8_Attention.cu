@@ -1,6 +1,228 @@
 #include "FP8_Attention.h"
 #include "softmax.h"
 
+// ---------------------------------------------------------------------------
+// FP8 FlashAttention kernel  —  *revised to avoid half‑overflow*
+// ---------------------------------------------------------------------------
+__global__ void fp8_flash_attention_kernel(
+  const half *__restrict__ query,   // [B,H,S,D]
+  const half *__restrict__ key,     // [B,H,S,D]
+  const half *__restrict__ value,   // [B,H,S,D]
+  half       *__restrict__ output,  // [B,H,S,D]
+  const QuantParams quant_params,
+  int batch_size, int num_heads,
+  int seq_len,    int head_dim,
+  float scale)                        // 1 / sqrt(head_dim)
+{
+  // ---------------- grid / thread geometry ----------------
+  const int bi        = blockIdx.x;                 // batch
+  const int hi        = blockIdx.y;                 // head
+  const int row_block = blockIdx.z;                 // query‑row tile
+
+  const int tx  = threadIdx.x;                      // 0 .. blockDim.x‑1
+  const int ty  = threadIdx.y;                      // 0 .. blockDim.y‑1
+  const int tid = ty * blockDim.x + tx;             // flattened
+
+  // ---------------- tile extents --------------------------
+  const int row_start       = row_block * BLOCK_SIZE_M;
+  const int row_end         = min(row_start + BLOCK_SIZE_M, seq_len);
+  const int rows_this_block = row_end - row_start;
+  const int row_idx         = row_start + ty;       // global row
+
+  // ---------------- shared memory -------------------------
+  __shared__ __nv_fp8_e4m3 q_tile[BLOCK_SIZE_M][BLOCK_SIZE_K];
+  __shared__ __nv_fp8_e4m3 k_tile[BLOCK_SIZE_N][BLOCK_SIZE_K];
+  __shared__ half          v_tile[BLOCK_SIZE_N][BLOCK_SIZE_K];
+
+  // *** logits now float to prevent overflow ***
+  __shared__ float         s_tile[BLOCK_SIZE_M][BLOCK_SIZE_N];
+
+  // per‑thread row accumulator for first BLOCK_SIZE_K dims
+  half row_output[BLOCK_SIZE_K] { };
+  #pragma unroll
+  for (int i = 0; i < BLOCK_SIZE_K; ++i) row_output[i] = __float2half(0.f);
+
+  // -------- per‑row online‑softmax scratch ----------------
+  float m_prev = -INFINITY;
+  float d_prev = 0.f;
+
+  // ========================================================
+  //  iterate over key/value column tiles
+  // ========================================================
+  for (int col_block = 0;
+       col_block < (seq_len + BLOCK_SIZE_N - 1) / BLOCK_SIZE_N;
+       ++col_block)
+  {
+      const int col_start       = col_block * BLOCK_SIZE_N;
+      const int col_end         = min(col_start + BLOCK_SIZE_N, seq_len);
+      const int cols_this_block = col_end - col_start;
+
+      // ---- CLEAR logits tile ---------------------------------
+      for (int i = tid; i < BLOCK_SIZE_M * BLOCK_SIZE_N;
+           i += blockDim.x * blockDim.y)
+      {
+          const int r = i / BLOCK_SIZE_N;
+          const int c = i % BLOCK_SIZE_N;
+          if (r < rows_this_block && c < cols_this_block)
+              s_tile[r][c] = 0.f;
+      }
+      __syncthreads();
+
+      // ========================================================
+      //  iterate over K‑dimension (head_dim) tiles
+      // ========================================================
+      for (int k_block = 0;
+           k_block < (head_dim + BLOCK_SIZE_K - 1) / BLOCK_SIZE_K;
+           ++k_block)
+      {
+          const int k_start      = k_block * BLOCK_SIZE_K;
+          const int k_end        = min(k_start + BLOCK_SIZE_K, head_dim);
+          const int k_this_block = k_end - k_start;
+
+          // ---- load & quantise Q tile -------------------------
+          for (int i = tid; i < rows_this_block * k_this_block;
+               i += blockDim.x * blockDim.y)
+          {
+              int lr = i / k_this_block;          // local row
+              int lk = i % k_this_block;          // local k
+
+              int q_idx =
+                  ((bi * num_heads + hi) * seq_len + (row_start + lr))
+                  * head_dim + (k_start + lk);
+              float q_fp32 = __half2float(query[q_idx]) / quant_params.scale_q;
+              q_fp32 = fminf(fmaxf(q_fp32, -448.f), 448.f);
+              q_tile[lr][lk] = __nv_fp8_e4m3(q_fp32);
+          }
+
+          // ---- load & quantise K tile -------------------------
+          for (int i = tid; i < cols_this_block * k_this_block;
+               i += blockDim.x * blockDim.y)
+          {
+              int lc = i / k_this_block;
+              int lk = i % k_this_block;
+
+              int k_idx =
+                  ((bi * num_heads + hi) * seq_len + (col_start + lc))
+                  * head_dim + (k_start + lk);
+              float k_fp32 = __half2float(key[k_idx]) / quant_params.scale_k;
+              k_fp32 = fminf(fmaxf(k_fp32, -448.f), 448.f);
+              k_tile[lc][lk] = __nv_fp8_e4m3(k_fp32);
+          }
+          __syncthreads();
+
+          // ---- dot‑product Q·Kᵀ accumulation ------------------
+          if (row_idx < row_end) {
+              for (int col_idx = col_start + tx; col_idx < col_end;
+                   col_idx += blockDim.x)
+              {
+                  int lc      = col_idx - col_start;
+                  float accum = 0.f;
+                  #pragma unroll
+                  for (int k = 0; k < k_this_block; ++k)
+                      accum += float(q_tile[ty][k]) * float(k_tile[lc][k]);
+
+                  // scale & de‑quant
+                  accum *= (scale * quant_params.scale_qk);
+
+                  // *** accumulate instead of overwrite ***
+                  s_tile[ty][lc] += accum;
+              }
+          }
+          __syncthreads();
+      } // --- k_block loop end ---
+
+      // only one thread per tile:
+if (blockIdx.x == 0            &&  // batch 0
+  blockIdx.y == 0            &&  // head 0
+  blockIdx.z == 0            &&  // row_block 0 → query‑pos 0..BLOCK_SIZE_M
+  threadIdx.x == 0           && 
+  threadIdx.y == 0) 
+{
+  // s_tile[ty][lc] → s_tile[0][0]
+  printf("[GPU] raw QK[0,0] = %.6f\n", s_tile[0][0]);
+}
+
+
+
+      // --------- reset soft‑max state at start of row ----------
+      if (col_block == 0) { m_prev = -INFINITY; d_prev = 0.f; }
+
+      // --------- online soft‑max for this col tile -------------
+      if (row_idx < row_end) {
+          float row_scores[BLOCK_SIZE_N];
+          #pragma unroll
+          for (int i = 0; i < cols_this_block; ++i)
+              row_scores[i] = s_tile[ty][i];
+
+          // assume `online_softmax_float` works on float* buffer
+          online_softmax_full(row_scores,
+                               m_prev, m_prev,   // m_curr not needed outside
+                               d_prev, d_prev,   // d_curr idem
+                               cols_this_block);
+
+          // write probabilities back (keep as float for precision)
+          #pragma unroll
+          for (int i = 0; i < cols_this_block; ++i)
+              s_tile[ty][i] = row_scores[i];
+      }
+      __syncthreads();
+
+      // --------- load V tile (FP16) -----------------------------
+      for (int i = tid; i < cols_this_block * head_dim;
+           i += blockDim.x * blockDim.y)
+      {
+          int lc = i / head_dim;
+          int lk = i % head_dim;
+
+          if (lk < BLOCK_SIZE_K && col_start + lc < seq_len) {
+              int v_idx =
+                  ((bi * num_heads + hi) * seq_len + (col_start + lc))
+                  * head_dim + lk;
+              v_tile[lc][lk] = value[v_idx];
+          }
+      }
+      __syncthreads();
+
+      // --------- accumulate output -----------------------------
+      if (row_idx < row_end) {
+          for (int k = tx; k < head_dim; k += blockDim.x) {
+              float acc = 0.f;
+              for (int j = 0; j < cols_this_block; ++j) {
+                  float attn = s_tile[ty][j];                     // float
+                  half  v_elt = (k < BLOCK_SIZE_K)
+                                ? v_tile[j][k]
+                                : value[((bi * num_heads + hi)
+                                       * seq_len + (col_start + j))
+                                       * head_dim + k];
+                  acc += attn * __half2float(v_elt);
+              }
+              if (k < BLOCK_SIZE_K) {
+                  row_output[k] = __float2half(
+                      __half2float(row_output[k]) + acc);
+              } else {
+                  int out_idx =
+                      ((bi * num_heads + hi) * seq_len + row_idx)
+                      * head_dim + k;
+                  output[out_idx] = __float2half(
+                      __half2float(output[out_idx]) + acc);
+              }
+          }
+      }
+      __syncthreads();
+  } // --- col_block loop end ---
+
+  // --------- flush register accumulator ------------------------
+  if (row_idx < seq_len) {
+      for (int k = tx; k < BLOCK_SIZE_K && k < head_dim; k += blockDim.x) {
+          int out_idx =
+              ((bi * num_heads + hi) * seq_len + row_idx) * head_dim + k;
+          output[out_idx] = row_output[k];
+      }
+  }
+}
+
+
+
 /**
  * Main kernel for FP8 quantized attention with FlashAttention-style tiling
  * Dimensions:
@@ -9,238 +231,240 @@
  * - seq_len: sequence length
  * - head_dim: dimensionality of each attention head
  */
-__global__ void fp8_flash_attention_kernel(
-    const half
-        *__restrict__ query, // [batch_size, num_heads, seq_len, head_dim]
-    const half
-        *__restrict__ key, // [batch_size, num_heads, seq_len, head_dim]
-    const half
-        *__restrict__ value, // [batch_size, num_heads, seq_len, head_dim]
-    half
-        *__restrict__ output, // [batch_size, num_heads, seq_len, head_dim]
-    const QuantParams quant_params, int batch_size, int num_heads,
-    int seq_len, int head_dim,
-    float scale) // 1/sqrt(head_dim) for scaled dot-product attention
-{
-  // Block indices
-  const int bi        = blockIdx.x; // Batch index
-  const int hi        = blockIdx.y; // Head index
-  const int row_block = blockIdx.z; // Block of seq_len (query dimension)
+// __global__ void fp8_flash_attention_kernel(
+//     const half
+//         *__restrict__ query, // [batch_size, num_heads, seq_len, head_dim]
+//     const half
+//         *__restrict__ key, // [batch_size, num_heads, seq_len, head_dim]
+//     const half
+//         *__restrict__ value, // [batch_size, num_heads, seq_len, head_dim]
+//     half
+//         *__restrict__ output, // [batch_size, num_heads, seq_len, head_dim]
+//     const QuantParams quant_params, int batch_size, int num_heads,
+//     int seq_len, int head_dim,
+//     float scale) // 1/sqrt(head_dim) for scaled dot-product attention
+// {
+//   // Block indices
+//   const int bi        = blockIdx.x; // Batch index
+//   const int hi        = blockIdx.y; // Head index
+//   const int row_block = blockIdx.z; // Block of seq_len (query dimension)
 
-  // Thread indices within block
-  const int tx  = threadIdx.x;          // Thread x-coordinate
-  const int ty  = threadIdx.y;          // Thread y-coordinate
-  const int tid = ty * blockDim.x + tx; // Flattened thread index
+//   // Thread indices within block
+//   const int tx  = threadIdx.x;          // Thread x-coordinate
+//   const int ty  = threadIdx.y;          // Thread y-coordinate
+//   const int tid = ty * blockDim.x + tx; // Flattened thread index
 
-  // Starting positions
-  const int row_start       = row_block * BLOCK_SIZE_M;
-  const int row_end         = min(row_start + BLOCK_SIZE_M, seq_len);
-  const int rows_this_block = row_end - row_start;
+//   // Starting positions
+//   const int row_start       = row_block * BLOCK_SIZE_M;
+//   const int row_end         = min(row_start + BLOCK_SIZE_M, seq_len);
+//   const int rows_this_block = row_end - row_start;
 
-  // Local row index within the block
-  const int row_idx = row_start + ty;
+//   // Local row index within the block
+//   const int row_idx = row_start + ty;
 
-  // Shared memory allocations for tiling
-  __shared__ __nv_fp8_e4m3
-      q_tile[BLOCK_SIZE_M][BLOCK_SIZE_K]; // Query tile in FP8
-  __shared__ __nv_fp8_e4m3
-      k_tile[BLOCK_SIZE_N][BLOCK_SIZE_K];             // Key tile in FP8
-  __shared__ half v_tile[BLOCK_SIZE_N][BLOCK_SIZE_K]; // Value tile in FP16
-  __shared__ half
-      s_tile[BLOCK_SIZE_M][BLOCK_SIZE_N]; // Attention scores for this tile
+//   // Shared memory allocations for tiling
+//   __shared__ __nv_fp8_e4m3
+//       q_tile[BLOCK_SIZE_M][BLOCK_SIZE_K]; // Query tile in FP8
+//   __shared__ __nv_fp8_e4m3
+//       k_tile[BLOCK_SIZE_N][BLOCK_SIZE_K];             // Key tile in FP8
+//   __shared__ half v_tile[BLOCK_SIZE_N][BLOCK_SIZE_K]; // Value tile in FP16
+//   __shared__ half
+//       s_tile[BLOCK_SIZE_M][BLOCK_SIZE_N]; // Attention scores for this tile
 
-  // Buffers for accumulating the output
-  half row_output[BLOCK_SIZE_K];
-  for (int i = 0; i < BLOCK_SIZE_K; i++) {
-    row_output[i] = __float2half(0.0f);
-  }
+//   // Buffers for accumulating the output
+//   half row_output[BLOCK_SIZE_K];
+//   for (int i = 0; i < BLOCK_SIZE_K; i++) {
+//     row_output[i] = __float2half(0.0f);
+//   }
 
-  // Variables for online softmax
-  float m_prev = -INFINITY; // Max value seen so far
-  float m_curr = -INFINITY; // Max value in current block
-  float d_prev = 0.0f;      // Denominator seen so far
-  float d_curr = 0.0f;      // Denominator for current block
+//   // Variables for online softmax
+//   float m_prev = -INFINITY; // Max value seen so far
+//   float m_curr = -INFINITY; // Max value in current block
+//   float d_prev = 0.0f;      // Denominator seen so far
+//   float d_curr = 0.0f;      // Denominator for current block
 
-  // Process key-value blocks in sequence length dimension
-  for (int col_block = 0;
-       col_block < (seq_len + BLOCK_SIZE_N - 1) / BLOCK_SIZE_N;
-       col_block++) {
-    const int col_start       = col_block * BLOCK_SIZE_N;
-    const int col_end         = min(col_start + BLOCK_SIZE_N, seq_len);
-    const int cols_this_block = col_end - col_start;
+//   // Process key-value blocks in sequence length dimension
+//   for (int col_block = 0;
+//        col_block < (seq_len + BLOCK_SIZE_N - 1) / BLOCK_SIZE_N;
+//        col_block++) {
+//     const int col_start       = col_block * BLOCK_SIZE_N;
+//     const int col_end         = min(col_start + BLOCK_SIZE_N, seq_len);
+//     const int cols_this_block = col_end - col_start;
 
-    // Clear shared memory tiles
-    for (int i = tid; i < BLOCK_SIZE_M * BLOCK_SIZE_N;
-         i += blockDim.x * blockDim.y) {
-      const int row = i / BLOCK_SIZE_N;
-      const int col = i % BLOCK_SIZE_N;
-      if (row < rows_this_block && col < cols_this_block) {
-        s_tile[row][col] = __float2half(0.0f);
-      }
-    }
-    __syncthreads();
+//     // Clear shared memory tiles
+//     for (int i = tid; i < BLOCK_SIZE_M * BLOCK_SIZE_N;
+//          i += blockDim.x * blockDim.y) {
+//       const int row = i / BLOCK_SIZE_N;
+//       const int col = i % BLOCK_SIZE_N;
+//       if (row < rows_this_block && col < cols_this_block) {
+//         s_tile[row][col] = __float2half(0.0f);
+//       }
+//     }
+//     __syncthreads();
 
-    // Process embedding dimension blocks (k-dimension)
-    for (int k_block = 0;
-         k_block < (head_dim + BLOCK_SIZE_K - 1) / BLOCK_SIZE_K;
-         k_block++) {
-      const int k_start      = k_block * BLOCK_SIZE_K;
-      const int k_end        = min(k_start + BLOCK_SIZE_K, head_dim);
-      const int k_this_block = k_end - k_start;
+//     // Process embedding dimension blocks (k-dimension)
+//     for (int k_block = 0;
+//          k_block < (head_dim + BLOCK_SIZE_K - 1) / BLOCK_SIZE_K;
+//          k_block++) {
+//       const int k_start      = k_block * BLOCK_SIZE_K;
+//       const int k_end        = min(k_start + BLOCK_SIZE_K, head_dim);
+//       const int k_this_block = k_end - k_start;
 
-      // Load query block into shared memory and quantize to FP8
-      for (int i = tid; i < rows_this_block * k_this_block;
-           i += blockDim.x * blockDim.y) {
-        const int local_row = i / k_this_block;
-        const int local_k   = i % k_this_block;
+//       // Load query block into shared memory and quantize to FP8
+//       for (int i = tid; i < rows_this_block * k_this_block;
+//            i += blockDim.x * blockDim.y) {
+//         const int local_row = i / k_this_block;
+//         const int local_k   = i % k_this_block;
 
-        if (row_start + local_row < seq_len &&
-            k_start + local_k < head_dim) {
-          // Compute flat index for query
-          int q_idx =
-              ((bi * num_heads + hi) * seq_len + (row_start + local_row)) *
-                  head_dim +
-              (k_start + local_k);
-          half q_val = query[q_idx];
+//         if (row_start + local_row < seq_len &&
+//             k_start + local_k < head_dim) {
+//           // Compute flat index for query
+//           int q_idx =
+//               ((bi * num_heads + hi) * seq_len + (row_start + local_row)) *
+//                   head_dim +
+//               (k_start + local_k);
+//           half q_val = query[q_idx];
 
-          // Quantize to FP8_E4M3
-          float fp32_val = __half2float(q_val) / quant_params.scale_q;
-          fp32_val       = fmaxf(fminf(fp32_val, 448.0f), -448.0f);
-          q_tile[local_row][local_k] = __nv_fp8_e4m3(fp32_val);
-        }
-      }
+//           // Quantize to FP8_E4M3
+//           float fp32_val = __half2float(q_val) / quant_params.scale_q;
+//           fp32_val       = fmaxf(fminf(fp32_val, 448.0f), -448.0f);
+//           q_tile[local_row][local_k] = __nv_fp8_e4m3(fp32_val);
+//         }
+//       }
 
-      // Load key block into shared memory and quantize to FP8
-      for (int i = tid; i < cols_this_block * k_this_block;
-           i += blockDim.x * blockDim.y) {
-        const int local_col = i / k_this_block;
-        const int local_k   = i % k_this_block;
+//       // Load key block into shared memory and quantize to FP8
+//       for (int i = tid; i < cols_this_block * k_this_block;
+//            i += blockDim.x * blockDim.y) {
+//         const int local_col = i / k_this_block;
+//         const int local_k   = i % k_this_block;
 
-        if (col_start + local_col < seq_len &&
-            k_start + local_k < head_dim) {
-          // Compute flat index for key
-          int k_idx =
-              ((bi * num_heads + hi) * seq_len + (col_start + local_col)) *
-                  head_dim +
-              (k_start + local_k);
-          half k_val = key[k_idx];
+//         if (col_start + local_col < seq_len &&
+//             k_start + local_k < head_dim) {
+//           // Compute flat index for key
+//           int k_idx =
+//               ((bi * num_heads + hi) * seq_len + (col_start + local_col)) *
+//                   head_dim +
+//               (k_start + local_k);
+//           half k_val = key[k_idx];
 
-          // Quantize to FP8_E4M3
-          float fp32_val = __half2float(k_val) / quant_params.scale_k;
-          fp32_val       = fmaxf(fminf(fp32_val, 448.0f), -448.0f);
-          k_tile[local_col][local_k] = __nv_fp8_e4m3(fp32_val);
-        }
-      }
+//           // Quantize to FP8_E4M3
+//           float fp32_val = __half2float(k_val) / quant_params.scale_k;
+//           fp32_val       = fmaxf(fminf(fp32_val, 448.0f), -448.0f);
+//           k_tile[local_col][local_k] = __nv_fp8_e4m3(fp32_val);
+//         }
+//       }
 
-      // Wait for all threads to finish loading Q and K tiles
-      __syncthreads();
+//       // Wait for all threads to finish loading Q and K tiles
+//       __syncthreads();
 
-      // Compute Q * K^T in reduced precision for this block
-      if (row_idx < row_end) {
-        for (int col_idx = col_start + tx; col_idx < col_end;
-             col_idx += blockDim.x) {
-          const int local_col = col_idx - col_start;
-          float dot_product   = 0.0f;
+//       // Compute Q * K^T in reduced precision for this block
+//       if (row_idx < row_end) {
+//         for (int col_idx = col_start + tx; col_idx < col_end;
+//              col_idx += blockDim.x) {
+//           const int local_col = col_idx - col_start;
+//           float dot_product   = 0.0f;
 
-          // Compute dot product of quantized vectors
-          for (int k = 0; k < k_this_block; k++) {
-            float q_val =
-                (float)q_tile[ty][k]; // Direct conversion instead of
-                                      // helper function
-            float k_val =
-                (float)k_tile[local_col][k]; // Direct conversion instead
-                                             // of helper function
-            dot_product += q_val * k_val;
-          }
+//           // Compute dot product of quantized vectors
+//           for (int k = 0; k < k_this_block; k++) {
+//             float q_val =
+//                 (float)q_tile[ty][k]; // Direct conversion instead of
+//                                       // helper function
+//             float k_val =
+//                 (float)k_tile[local_col][k]; // Direct conversion instead
+//                                              // of helper function
+//             dot_product += q_val * k_val;
+//           }
 
-          // Apply scaling and dequantization
-          dot_product = dot_product * scale * quant_params.scale_qk;
+//           // Apply scaling and dequantization
+//           dot_product = dot_product * scale * quant_params.scale_qk;
 
-          // Store in shared memory
-          s_tile[ty][local_col] = __float2half(dot_product);
-        }
-      }
+//           // Store in shared memory
+//           // s_tile[ty][local_col] = __float2half(dot_product);
+//           s_tile[ty][local_col] =
+//           __float2half(__half2float(s_tile[ty][local_col]) + dot_product);
+//         }
+//       }
 
-      // Wait for all threads to finish computing attention scores
-      __syncthreads();
-    }
+//       // Wait for all threads to finish computing attention scores
+//       __syncthreads();
+//     }
 
-    // Apply online softmax to this block of scores
-    if (row_idx < row_end) {
-      half row_scores[BLOCK_SIZE_N];
-      for (int i = 0; i < cols_this_block; i++) {
-        row_scores[i] = s_tile[ty][i];
-      }
+//     // Apply online softmax to this block of scores
+//     if (row_idx < row_end) {
+//       half row_scores[BLOCK_SIZE_N];
+//       for (int i = 0; i < cols_this_block; i++) {
+//         row_scores[i] = s_tile[ty][i];
+//       }
 
-      // Apply online softmax
-      improved_online_softmax_two(row_scores, m_prev, m_curr, d_prev, d_curr,
-                     cols_this_block);
+//       // Apply online softmax
+//       improved_online_softmax_two(row_scores, m_prev, m_curr, d_prev, d_curr,
+//                      cols_this_block);
 
-      // Update the shared memory with softmax results
-      for (int i = 0; i < cols_this_block; i++) {
-        s_tile[ty][i] = row_scores[i];
-      }
-    }
-    __syncthreads();
+//       // Update the shared memory with softmax results
+//       for (int i = 0; i < cols_this_block; i++) {
+//         s_tile[ty][i] = row_scores[i];
+//       }
+//     }
+//     __syncthreads();
 
-    // Load value block in FP16 precision
-    for (int i = tid; i < cols_this_block * head_dim;
-         i += blockDim.x * blockDim.y) {
-      const int local_col = i / head_dim;
-      const int local_k   = i % head_dim;
+//     // Load value block in FP16 precision
+//     for (int i = tid; i < cols_this_block * head_dim;
+//          i += blockDim.x * blockDim.y) {
+//       const int local_col = i / head_dim;
+//       const int local_k   = i % head_dim;
 
-      if (local_k < head_dim) {
-        // Calculate flat index for value
-        int v_idx =
-            ((bi * num_heads + hi) * seq_len + (col_start + local_col)) *
-                head_dim +
-            local_k;
+//       if (local_k < head_dim) {
+//         // Calculate flat index for value
+//         int v_idx =
+//             ((bi * num_heads + hi) * seq_len + (col_start + local_col)) *
+//                 head_dim +
+//             local_k;
 
-        if (local_k < BLOCK_SIZE_K && col_start + local_col < seq_len) {
-          v_tile[local_col][local_k] = value[v_idx];
-        }
-      }
-    }
-    __syncthreads();
+//         if (local_k < BLOCK_SIZE_K && col_start + local_col < seq_len) {
+//           v_tile[local_col][local_k] = value[v_idx];
+//         }
+//       }
+//     }
+//     __syncthreads();
 
-    // Compute attention output in FP16 (softmax(Q*K^T) * V)
-    if (row_idx < row_end) {
-      for (int k = tx; k < head_dim; k += blockDim.x) {
-        float acc = 0.0f;
-        for (int j = 0; j < cols_this_block; j++) {
-          half attn_weight = s_tile[ty][j];
-          half val         = (k < BLOCK_SIZE_K)
-                                 ? v_tile[j][k]
-                                 : value[((bi * num_heads + hi) * seq_len +
-                                  (col_start + j)) *
-                                     head_dim +
-                                 k];
-          acc += __half2float(attn_weight) * __half2float(val);
-        }
+//     // Compute attention output in FP16 (softmax(Q*K^T) * V)
+//     if (row_idx < row_end) {
+//       for (int k = tx; k < head_dim; k += blockDim.x) {
+//         float acc = 0.0f;
+//         for (int j = 0; j < cols_this_block; j++) {
+//           half attn_weight = s_tile[ty][j];
+//           half val         = (k < BLOCK_SIZE_K)
+//                                  ? v_tile[j][k]
+//                                  : value[((bi * num_heads + hi) * seq_len +
+//                                   (col_start + j)) *
+//                                      head_dim +
+//                                  k];
+//           acc += __half2float(attn_weight) * __half2float(val);
+//         }
 
-        // Accumulate in the output buffer
-        if (k < BLOCK_SIZE_K) {
-          row_output[k] = __float2half(__half2float(row_output[k]) + acc);
-        } else {
-          int out_idx =
-              ((bi * num_heads + hi) * seq_len + row_idx) * head_dim + k;
-          output[out_idx] =
-              __float2half(__half2float(output[out_idx]) + acc);
-        }
-      }
-    }
-    __syncthreads();
-  }
+//         // Accumulate in the output buffer
+//         if (k < BLOCK_SIZE_K) {
+//           row_output[k] = __float2half(__half2float(row_output[k]) + acc);
+//         } else {
+//           int out_idx =
+//               ((bi * num_heads + hi) * seq_len + row_idx) * head_dim + k;
+//           output[out_idx] =
+//               __float2half(__half2float(output[out_idx]) + acc);
+//         }
+//       }
+//     }
+//     __syncthreads();
+//   }
 
-  // Write accumulated output for the first BLOCK_SIZE_K elements
-  if (row_idx < seq_len) {
-    for (int k = tx; k < BLOCK_SIZE_K && k < head_dim; k += blockDim.x) {
-      int out_idx =
-          ((bi * num_heads + hi) * seq_len + row_idx) * head_dim + k;
-      output[out_idx] = row_output[k];
-    }
-  }
-}
+//   // Write accumulated output for the first BLOCK_SIZE_K elements
+//   if (row_idx < seq_len) {
+//     for (int k = tx; k < BLOCK_SIZE_K && k < head_dim; k += blockDim.x) {
+//       int out_idx =
+//           ((bi * num_heads + hi) * seq_len + row_idx) * head_dim + k;
+//       output[out_idx] = row_output[k];
+//     }
+//   }
+// }
 
 /**
  * Main kernel for F32 attention with FlashAttention-style tiling
@@ -581,151 +805,97 @@ __global__ void findMinMax(const half* data, float* min_max_values, int size) {
 
 /**
  * Improved function to compute quantization parameters
- * Uses per-head quantization and adaptive scaling techniques.
+ * Uses per-head quantization and adaptive scaling techniques,
+ * driven by the findMinMax kernel for host‑device reduction.
  */
-void compute_quant_params_two(const half *query, const half *key,
-                          int batch_size, int num_heads, int seq_len,
-                          int head_dim, QuantParams &params) {
-    // Constants for FP8 E4M3 format
-    const float fp8_max_value = 448.0f;
-    const float safety_factor = 0.98f;  // Increased from 0.9 to 0.98
-    
-    // If test data shows better results with fixed scales, use a hybrid approach
-    const bool use_fixed_scale = false;  // Set based on empirical tests
-    const float fixed_scale_value = 10.0f;
-    
-    // For per-head or global quantization
-    const bool use_per_head = false;  // Toggle for per-head quantization
-    
-    if (use_fixed_scale) {
-        // Use the original fixed scale that worked well in your tests
-        params.scale_q = fixed_scale_value;
-        params.scale_k = fixed_scale_value;
-        params.scale_qk = params.scale_q * params.scale_k;
-        return;
-    }
-    
-    // Allocate device memory for min/max values
-    const int num_blocks = 256;
-    float *d_q_min_max, *d_k_min_max;
-    cudaMalloc(&d_q_min_max, num_blocks * 2 * sizeof(float));
-    cudaMalloc(&d_k_min_max, num_blocks * 2 * sizeof(float));
-    
-    // Configuration for kernel launch
-    int threads_per_block = 256;
-    int shared_mem_size = 2 * threads_per_block * sizeof(float);
-    
-    if (use_per_head) {
-        // Per-head quantization - calculate scales for each attention head
-        params.scale_q = 0;  // Will compute average scale across heads
-        params.scale_k = 0;
-        
-        for (int h = 0; h < num_heads; h++) {
-            // Calculate offsets for this head
-            size_t head_elements = seq_len * head_dim;
-            const half* q_head = query + h * head_elements;
-            const half* k_head = key + h * head_elements;
-            
-            // Find min/max for this head
-            findMinMax<<<num_blocks, threads_per_block, shared_mem_size>>>(
-                q_head, d_q_min_max, head_elements);
-            findMinMax<<<num_blocks, threads_per_block, shared_mem_size>>>(
-                k_head, d_k_min_max, head_elements);
-            
-            // Copy results back to host
-            float *h_q_min_max = new float[num_blocks * 2];
-            float *h_k_min_max = new float[num_blocks * 2];
-            
-            cudaMemcpy(h_q_min_max, d_q_min_max, num_blocks * 2 * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_k_min_max, d_k_min_max, num_blocks * 2 * sizeof(float), cudaMemcpyDeviceToHost);
-            
-            // Find global min/max from block results
-            float q_min = FLT_MAX, q_max = -FLT_MAX;
-            float k_min = FLT_MAX, k_max = -FLT_MAX;
-            
-            for (int i = 0; i < num_blocks; i++) {
-                q_min = fminf(q_min, h_q_min_max[i * 2]);
-                q_max = fmaxf(q_max, h_q_min_max[i * 2 + 1]);
-                k_min = fminf(k_min, h_k_min_max[i * 2]);
-                k_max = fmaxf(k_max, h_k_min_max[i * 2 + 1]);
-            }
-            
-            // Compute absolute max values
-            float q_abs_max = fmaxf(fabsf(q_min), fabsf(q_max));
-            float k_abs_max = fmaxf(fabsf(k_min), fabsf(k_max));
-            
-            // Add to running total for average calculation
-            float head_scale_q = q_abs_max > 0 ? (fp8_max_value * safety_factor) / q_abs_max : 1.0f;
-            float head_scale_k = k_abs_max > 0 ? (fp8_max_value * safety_factor) / k_abs_max : 1.0f;
-            
-            params.scale_q += head_scale_q;
-            params.scale_k += head_scale_k;
-            
-            delete[] h_q_min_max;
-            delete[] h_k_min_max;
-        }
-        
-        // Compute average scale across heads
-        params.scale_q /= num_heads;
-        params.scale_k /= num_heads;
-        
-    } else {
-        // Global quantization (across all heads)
-        int total_elements = batch_size * num_heads * seq_len * head_dim;
-        
-        // Launch kernel to find min/max
-        findMinMax<<<num_blocks, threads_per_block, shared_mem_size>>>(
-            query, d_q_min_max, total_elements);
-        findMinMax<<<num_blocks, threads_per_block, shared_mem_size>>>(
-            key, d_k_min_max, total_elements);
-        
-        // Copy results back to host
-        float *h_q_min_max = new float[num_blocks * 2];
-        float *h_k_min_max = new float[num_blocks * 2];
-        
-        cudaMemcpy(h_q_min_max, d_q_min_max, num_blocks * 2 * sizeof(float), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_k_min_max, d_k_min_max, num_blocks * 2 * sizeof(float), cudaMemcpyDeviceToHost);
-        
-        // Find global min/max from block results
-        float q_min = FLT_MAX, q_max = -FLT_MAX;
-        float k_min = FLT_MAX, k_max = -FLT_MAX;
-        
-        for (int i = 0; i < num_blocks; i++) {
-            q_min = fminf(q_min, h_q_min_max[i * 2]);
-            q_max = fmaxf(q_max, h_q_min_max[i * 2 + 1]);
-            k_min = fminf(k_min, h_k_min_max[i * 2]);
-            k_max = fmaxf(k_max, h_k_min_max[i * 2 + 1]);
-        }
-        
-        // Compute absolute max values
-        float q_abs_max = fmaxf(fabsf(q_min), fabsf(q_max));
-        float k_abs_max = fmaxf(fabsf(k_min), fabsf(k_max));
-        
-        // Hybrid approach - if values are small, fixed scales might work better
-        if (q_abs_max < 5.0f && k_abs_max < 5.0f) {
-            params.scale_q = fixed_scale_value;
-            params.scale_k = fixed_scale_value;
-        } else {
-            // Calculate scale factors with improved safety factor
-            params.scale_q = q_abs_max > 0 ? (fp8_max_value * safety_factor) / q_abs_max : 1.0f;
-            params.scale_k = k_abs_max > 0 ? (fp8_max_value * safety_factor) / k_abs_max : 1.0f;
-        }
-        
-        delete[] h_q_min_max;
-        delete[] h_k_min_max;
-    }
-    
-    // Set the combined scale
-    params.scale_qk = params.scale_q * params.scale_k;
-    
-    // Clean up device memory
-    cudaFree(d_q_min_max);
-    cudaFree(d_k_min_max);
-    
-    // Debug output
-    // printf("Scale factors: q=%.4f, k=%.4f, qk=%.4f\n", 
-    //    params.scale_q, params.scale_k, params.scale_qk);
+ void compute_quant_params_two(
+  const half *query, const half *key,
+  int batch_size, int num_heads,
+  int seq_len, int head_dim,
+  QuantParams &params)
+{
+  // FP8 E4M3 range
+  const float fp8_max_value = 448.0f;
+  const float safety_factor = 0.98f;
+
+  // Launch configuration for findMinMax
+  const int threads_per_block = 256;
+  const int num_blocks        = 256;
+  const int shared_mem_bytes  = 2 * threads_per_block * sizeof(float);
+
+  // We'll accumulate per-head scales here
+  float accum_scale_q = 0.0f;
+  float accum_scale_k = 0.0f;
+
+  // Elements per head across all batches
+  size_t head_elems = size_t(batch_size) * seq_len * head_dim;
+
+  // Device buffers for min/max results (min,max pairs per block)
+  float *d_q_min_max, *d_k_min_max;
+  cudaMalloc(&d_q_min_max, num_blocks * 2 * sizeof(float));
+  cudaMalloc(&d_k_min_max, num_blocks * 2 * sizeof(float));
+
+  // Host buffers to collect block‑level min/max
+  std::vector<float> h_q_min_max(num_blocks * 2);
+  std::vector<float> h_k_min_max(num_blocks * 2);
+
+  for (int h = 0; h < num_heads; ++h) {
+      // Pointer to head h across all batches
+      const half* q_head = query + size_t(h) * head_elems;
+      const half* k_head = key   + size_t(h) * head_elems;
+
+      // 1) launch min/max kernels
+      findMinMax<<<num_blocks, threads_per_block, shared_mem_bytes>>>(
+          q_head, d_q_min_max, int(head_elems));
+      findMinMax<<<num_blocks, threads_per_block, shared_mem_bytes>>>(
+          k_head, d_k_min_max, int(head_elems));
+      cudaDeviceSynchronize();
+
+      // 2) copy back to host
+      cudaMemcpy(h_q_min_max.data(), d_q_min_max,
+                 num_blocks * 2 * sizeof(float),
+                 cudaMemcpyDeviceToHost);
+      cudaMemcpy(h_k_min_max.data(), d_k_min_max,
+                 num_blocks * 2 * sizeof(float),
+                 cudaMemcpyDeviceToHost);
+
+      // 3) reduce block results to global min/max per head
+      float q_min =  FLT_MAX, q_max = -FLT_MAX;
+      float k_min =  FLT_MAX, k_max = -FLT_MAX;
+      for (int i = 0; i < num_blocks; ++i) {
+          q_min = fminf(q_min, h_q_min_max[2*i]);
+          q_max = fmaxf(q_max, h_q_min_max[2*i+1]);
+          k_min = fminf(k_min, h_k_min_max[2*i]);
+          k_max = fmaxf(k_max, h_k_min_max[2*i+1]);
+      }
+
+      // 4) compute absolute maxima
+      float q_abs_max = fmaxf(fabsf(q_min), fabsf(q_max));
+      float k_abs_max = fmaxf(fabsf(k_min), fabsf(k_max));
+
+      // 5) quant scales = abs_max / (fp8_max * safety)
+      float head_scale_q = (q_abs_max > 0.f)
+          ? (q_abs_max / (fp8_max_value * safety_factor))
+          : 1.0f;
+      float head_scale_k = (k_abs_max > 0.f)
+          ? (k_abs_max / (fp8_max_value * safety_factor))
+          : 1.0f;
+
+      accum_scale_q += head_scale_q;
+      accum_scale_k += head_scale_k;
+  }
+
+  // average over heads
+  params.scale_q  = accum_scale_q / float(num_heads);
+  params.scale_k  = accum_scale_k / float(num_heads);
+  params.scale_qk = params.scale_q * params.scale_k;
+
+  // clean up
+  cudaFree(d_q_min_max);
+  cudaFree(d_k_min_max);
 }
+
+
 
 // Host function to launch the quantized attention kernel
 void fp8_quantized_attention(const half *query, const half *key,
@@ -813,6 +983,11 @@ void reference_attention(const float *query, const float *key,
 
           // Apply scaling
           attention_scores[q_seq * seq_len + k_seq] = dot_product * scale;
+          if (b == 0 && h == 0 && q_seq == 0 && k_seq == 0) {
+            printf("[CPU] raw logit[0,0] = %.6f\n",
+                   attention_scores[0]);
+          }
+
         }
 
         // Apply softmax row-wise (for each query sequence position)

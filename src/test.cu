@@ -9,7 +9,7 @@ int main(int argc, char **argv) {
   int num_heads  = 1;
   int seq_len    = 8;
   int head_dim   = 8;
-  float range    = 1.0f;
+  float range    = 200.0f;
   unsigned seed  = 0;
 
   // Define timing variables
@@ -146,7 +146,6 @@ int main(int argc, char **argv) {
             << "  CosineSim   (↑) = " << cosine_sim << "\n"
             << "  Relative L1 (↓) = " << rel_l1 << "\n"
             << "  RMSE        (↓) = " << rmse << "\n";
-  // here to implement performance measurement
 
   cudaFree(d_q);
   cudaFree(d_k);
