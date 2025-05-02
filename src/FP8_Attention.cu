@@ -633,11 +633,13 @@ void compute_quant_params_two(const half *query, const half *key,
     // Make sure scale factors are at least 1 to avoid precision loss
     params.scale_q = q_abs_max > 0 ? fmaxf(q_abs_max / (fp8_max_value * safety_factor), 1.0f) : 1.0f;
     params.scale_k = k_abs_max > 0 ? fmaxf(k_abs_max / (fp8_max_value * safety_factor), 1.0f) : 1.0f;
+    printf("Scale factors: q=%.4f, k=%.4f\n", params.scale_q, params.scale_k);
     
     // Calculate attention scale based on actual observed values
     // Max possible Q*K value after quantization: (q_abs_max / scale_q) * (k_abs_max / scale_k) * head_dim
-    float max_qk_value = (q_abs_max / params.scale_q) * (k_abs_max / params.scale_k) * head_dim;
-    params.attn_scale = fp16_max_value / max_qk_value;
+    float max_qk_value = fminf(480,q_abs_max)*fminf(480,k_abs_max);
+    printf("Max Q*K value: %.4f\n", max_qk_value);
+    params.attn_scale = max_qk_value/ fp16_max_value;
     params.attn_scale = fmaxf(params.attn_scale, 1.0f); // Ensure attn_scale is at least 1
     
     // Set the combined scale
