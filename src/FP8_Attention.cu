@@ -178,7 +178,10 @@ __global__ void fp8_flash_attention_kernel(
 
       // Update the shared memory with softmax results
       for (int i = 0; i < cols_this_block; i++) {
-        s_tile[ty][i] = row_scores[i];
+        // Dequantize the attention weights
+        float attn_weight = __half2float(row_scores[i]);
+        attn_weight = attn_weight / (quant_params.scale_q * quant_params.scale_k);
+        s_tile[ty][i] = __float2half(attn_weight);
       }
     }
     __syncthreads();
@@ -523,16 +526,7 @@ fp32_naive_attention_kernel(const float *__restrict__ query, // [B,H,L,D]
   O[pos * D + d] = acc;
 }
 
-// Helper function to determine quantization parameters
-void compute_quant_params(const half *query, const half *key,
-                          int batch_size, int num_heads, int seq_len,
-                          int head_dim, QuantParams &params) {
 
-  params.scale_q = 10.0f; // the scale should be determined by data range
-                          // of the actuall llm embedding
-  params.scale_k  = 10.0f;
-  params.scale_qk = params.scale_q * params.scale_k;
-}
 
 /**
  * Kernel to find min/max values in parallel
@@ -586,24 +580,9 @@ __global__ void findMinMax(const half* data, float* min_max_values, int size) {
 void compute_quant_params_two(const half *query, const half *key,
                           int batch_size, int num_heads, int seq_len,
                           int head_dim, QuantParams &params) {
-    // Constants for FP8 E4M3 format
-    const float fp8_max_value = 448.0f;
-    const float safety_factor = 0.98f;  // Increased from 0.9 to 0.98
-    
-    // If test data shows better results with fixed scales, use a hybrid approach
-    const bool use_fixed_scale = false;  // Set based on empirical tests
-    const float fixed_scale_value = 10.0f;
-    
-    // For per-head or global quantization
-    const bool use_per_head = false;  // Toggle for per-head quantization
-    
-    if (use_fixed_scale) {
-        // Use the original fixed scale that worked well in your tests
-        params.scale_q = fixed_scale_value;
-        params.scale_k = fixed_scale_value;
-        params.scale_qk = params.scale_q * params.scale_k;
-        return;
-    }
+    // Constants for FP8_E4M3
+    const float fp8_max_value = 448.0f;  // Maximum value for FP8_E4M3
+    const float safety_factor = 0.9f;    // Safety factor to prevent overflow
     
     // Allocate device memory for min/max values
     const int num_blocks = 256;
@@ -615,116 +594,53 @@ void compute_quant_params_two(const half *query, const half *key,
     int threads_per_block = 256;
     int shared_mem_size = 2 * threads_per_block * sizeof(float);
     
-    if (use_per_head) {
-        // Per-head quantization - calculate scales for each attention head
-        params.scale_q = 0;  // Will compute average scale across heads
-        params.scale_k = 0;
-        
-        for (int h = 0; h < num_heads; h++) {
-            // Calculate offsets for this head
-            size_t head_elements = seq_len * head_dim;
-            const half* q_head = query + h * head_elements;
-            const half* k_head = key + h * head_elements;
-            
-            // Find min/max for this head
-            findMinMax<<<num_blocks, threads_per_block, shared_mem_size>>>(
-                q_head, d_q_min_max, head_elements);
-            findMinMax<<<num_blocks, threads_per_block, shared_mem_size>>>(
-                k_head, d_k_min_max, head_elements);
-            
-            // Copy results back to host
-            float *h_q_min_max = new float[num_blocks * 2];
-            float *h_k_min_max = new float[num_blocks * 2];
-            
-            cudaMemcpy(h_q_min_max, d_q_min_max, num_blocks * 2 * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_k_min_max, d_k_min_max, num_blocks * 2 * sizeof(float), cudaMemcpyDeviceToHost);
-            
-            // Find global min/max from block results
-            float q_min = FLT_MAX, q_max = -FLT_MAX;
-            float k_min = FLT_MAX, k_max = -FLT_MAX;
-            
-            for (int i = 0; i < num_blocks; i++) {
-                q_min = fminf(q_min, h_q_min_max[i * 2]);
-                q_max = fmaxf(q_max, h_q_min_max[i * 2 + 1]);
-                k_min = fminf(k_min, h_k_min_max[i * 2]);
-                k_max = fmaxf(k_max, h_k_min_max[i * 2 + 1]);
-            }
-            
-            // Compute absolute max values
-            float q_abs_max = fmaxf(fabsf(q_min), fabsf(q_max));
-            float k_abs_max = fmaxf(fabsf(k_min), fabsf(k_max));
-            
-            // Add to running total for average calculation
-            float head_scale_q = q_abs_max > 0 ? (fp8_max_value * safety_factor) / q_abs_max : 1.0f;
-            float head_scale_k = k_abs_max > 0 ? (fp8_max_value * safety_factor) / k_abs_max : 1.0f;
-            
-            params.scale_q += head_scale_q;
-            params.scale_k += head_scale_k;
-            
-            delete[] h_q_min_max;
-            delete[] h_k_min_max;
-        }
-        
-        // Compute average scale across heads
-        params.scale_q /= num_heads;
-        params.scale_k /= num_heads;
-        
-    } else {
-        // Global quantization (across all heads)
-        int total_elements = batch_size * num_heads * seq_len * head_dim;
-        
-        // Launch kernel to find min/max
-        findMinMax<<<num_blocks, threads_per_block, shared_mem_size>>>(
-            query, d_q_min_max, total_elements);
-        findMinMax<<<num_blocks, threads_per_block, shared_mem_size>>>(
-            key, d_k_min_max, total_elements);
-        
-        // Copy results back to host
-        float *h_q_min_max = new float[num_blocks * 2];
-        float *h_k_min_max = new float[num_blocks * 2];
-        
-        cudaMemcpy(h_q_min_max, d_q_min_max, num_blocks * 2 * sizeof(float), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_k_min_max, d_k_min_max, num_blocks * 2 * sizeof(float), cudaMemcpyDeviceToHost);
-        
-        // Find global min/max from block results
-        float q_min = FLT_MAX, q_max = -FLT_MAX;
-        float k_min = FLT_MAX, k_max = -FLT_MAX;
-        
-        for (int i = 0; i < num_blocks; i++) {
-            q_min = fminf(q_min, h_q_min_max[i * 2]);
-            q_max = fmaxf(q_max, h_q_min_max[i * 2 + 1]);
-            k_min = fminf(k_min, h_k_min_max[i * 2]);
-            k_max = fmaxf(k_max, h_k_min_max[i * 2 + 1]);
-        }
-        
-        // Compute absolute max values
-        float q_abs_max = fmaxf(fabsf(q_min), fabsf(q_max));
-        float k_abs_max = fmaxf(fabsf(k_min), fabsf(k_max));
-        
-        // Hybrid approach - if values are small, fixed scales might work better
-        if (q_abs_max < 5.0f && k_abs_max < 5.0f) {
-            params.scale_q = fixed_scale_value;
-            params.scale_k = fixed_scale_value;
-        } else {
-            // Calculate scale factors with improved safety factor
-            params.scale_q = q_abs_max > 0 ? (fp8_max_value * safety_factor) / q_abs_max : 1.0f;
-            params.scale_k = k_abs_max > 0 ? (fp8_max_value * safety_factor) / k_abs_max : 1.0f;
-        }
-        
-        delete[] h_q_min_max;
-        delete[] h_k_min_max;
+    // Global quantization (across all heads)
+    int total_elements = batch_size * num_heads * seq_len * head_dim;
+    
+    // Launch kernel to find min/max
+    findMinMax<<<num_blocks, threads_per_block, shared_mem_size>>>(
+        query, d_q_min_max, total_elements);
+    findMinMax<<<num_blocks, threads_per_block, shared_mem_size>>>(
+        key, d_k_min_max, total_elements);
+    
+    // Copy results back to host
+    float *h_q_min_max = new float[num_blocks * 2];
+    float *h_k_min_max = new float[num_blocks * 2];
+    
+    cudaMemcpy(h_q_min_max, d_q_min_max, num_blocks * 2 * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_k_min_max, d_k_min_max, num_blocks * 2 * sizeof(float), cudaMemcpyDeviceToHost);
+    
+    // Find global min/max from block results
+    float q_min = FLT_MAX, q_max = -FLT_MAX;
+    float k_min = FLT_MAX, k_max = -FLT_MAX;
+    
+    for (int i = 0; i < num_blocks; i++) {
+        q_min = fminf(q_min, h_q_min_max[i * 2]);
+        q_max = fmaxf(q_max, h_q_min_max[i * 2 + 1]);
+        k_min = fminf(k_min, h_k_min_max[i * 2]);
+        k_max = fmaxf(k_max, h_k_min_max[i * 2 + 1]);
     }
+    
+    // Compute absolute max values
+    float q_abs_max = fmaxf(fabsf(q_min), fabsf(q_max));
+    float k_abs_max = fmaxf(fabsf(k_min), fabsf(k_max));
+    
+    // Calculate scale factors to fit within FP8 range
+    params.scale_q = q_abs_max > 0 ? (fp8_max_value * safety_factor) / q_abs_max : 1.0f;
+    params.scale_k = k_abs_max > 0 ? (fp8_max_value * safety_factor) / k_abs_max : 1.0f;
     
     // Set the combined scale
     params.scale_qk = params.scale_q * params.scale_k;
     
-    // Clean up device memory
+    // Clean up
+    delete[] h_q_min_max;
+    delete[] h_k_min_max;
     cudaFree(d_q_min_max);
     cudaFree(d_k_min_max);
     
     // Debug output
-    // printf("Scale factors: q=%.4f, k=%.4f, qk=%.4f\n", 
-    //    params.scale_q, params.scale_k, params.scale_qk);
+    printf("Scale factors: q=%.4f, k=%.4f, qk=%.4f\n", 
+           params.scale_q, params.scale_k, params.scale_qk);
 }
 
 // Host function to launch the quantized attention kernel
