@@ -154,7 +154,7 @@ __global__ void fp8_flash_attention_kernel(
           }
 
           // Apply scaling and dequantization
-          dot_product = dot_product * scale * quant_params.scale_qk;
+          dot_product = dot_product * scale * quant_params.scale_qk * quant_params.attn_scale;
 
           // Store in shared memory
           s_tile[ty][local_col] = __float2half(dot_product);
@@ -180,7 +180,6 @@ __global__ void fp8_flash_attention_kernel(
       for (int i = 0; i < cols_this_block; i++) {
         // Dequantize the attention weights
         float attn_weight = __half2float(row_scores[i]);
-        attn_weight = attn_weight / (quant_params.scale_q * quant_params.scale_k);
         s_tile[ty][i] = __float2half(attn_weight);
       }
     }
@@ -573,6 +572,13 @@ __global__ void findMinMax(const half* data, float* min_max_values, int size) {
     }
 }
 
+struct QuantParams {
+    float scale_q;  // Scale factor for query
+    float scale_k;  // Scale factor for key
+    float scale_qk; // Combined scale for Q*K
+    float attn_scale; // Scale factor to keep attention scores in FP16 range
+};
+
 /**
  * Improved function to compute quantization parameters
  * Uses per-head quantization and adaptive scaling techniques.
@@ -583,6 +589,7 @@ void compute_quant_params_two(const half *query, const half *key,
     // Constants for FP8_E4M3
     const float fp8_max_value = 448.0f;  // Maximum value for FP8_E4M3
     const float safety_factor = 0.9f;    // Safety factor to prevent overflow
+    const float fp16_max_value = 65504.0f; // Maximum value for FP16
     
     // Allocate device memory for min/max values
     const int num_blocks = 256;
@@ -626,8 +633,16 @@ void compute_quant_params_two(const half *query, const half *key,
     float k_abs_max = fmaxf(fabsf(k_min), fabsf(k_max));
     
     // Calculate scale factors to fit within FP8 range
-    params.scale_q = q_abs_max > 0 ? (fp8_max_value * safety_factor) / q_abs_max : 1.0f;
-    params.scale_k = k_abs_max > 0 ? (fp8_max_value * safety_factor) / k_abs_max : 1.0f;
+    // We want to scale the values to fit within FP8 range
+    // Make sure scale factors are at least 1 to avoid precision loss
+    params.scale_q = q_abs_max > 0 ? fmaxf(q_abs_max / (fp8_max_value * safety_factor), 1.0f) : 1.0f;
+    params.scale_k = k_abs_max > 0 ? fmaxf(k_abs_max / (fp8_max_value * safety_factor), 1.0f) : 1.0f;
+    
+    // Calculate attention scale based on actual observed values
+    // Max possible Q*K value after quantization: (q_abs_max / scale_q) * (k_abs_max / scale_k) * head_dim
+    float max_qk_value = (q_abs_max / params.scale_q) * (k_abs_max / params.scale_k) * head_dim;
+    params.attn_scale = fp16_max_value / max_qk_value;
+    params.attn_scale = fmaxf(params.attn_scale, 1.0f); // Ensure attn_scale is at least 1
     
     // Set the combined scale
     params.scale_qk = params.scale_q * params.scale_k;
@@ -639,8 +654,8 @@ void compute_quant_params_two(const half *query, const half *key,
     cudaFree(d_k_min_max);
     
     // Debug output
-    printf("Scale factors: q=%.4f, k=%.4f, qk=%.4f\n", 
-           params.scale_q, params.scale_k, params.scale_qk);
+    printf("Scale factors: q=%.4f, k=%.4f, qk=%.4f, attn=%.4f\n", 
+           params.scale_q, params.scale_k, params.scale_qk, params.attn_scale);
 }
 
 // Host function to launch the quantized attention kernel
