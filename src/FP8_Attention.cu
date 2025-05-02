@@ -1032,7 +1032,8 @@ void reference_attention(const float *query, const float *key,
     }
   }
 }
-// Reference CPU implementation of attention for comparison
+
+// Reference GPU implementation of attention for comparison
 void reference_gpu_attention(const float *query, const float *key,
                              const float *value, float *output,
                              int batch_size, int num_heads, int seq_len,
@@ -1052,20 +1053,20 @@ void reference_gpu_attention(const float *query, const float *key,
   dim3 block(32, 4); // 128 threads per block
 
   //   // Launch kernel
-  //   switch (stra) {
+    switch (stra) {
 
-  //     case attention_strategy::tiled:
-  //       fp32_attention_kernel<<<grid, block>>>(query, key, value,
-  //       output,
-  //                                              batch_size, num_heads,
-  //                                              seq_len, head_dim,
-  //                                              scale);
-  //       break;
-  //     case attention_strategy::untiled:
-  //       fp32_naive_attention_kernel<<<grid, block>>>(
-  //           query, key, value, output, batch_size, num_heads, seq_len,
-  //           head_dim, scale);
-  //   }
+      case attention_strategy::tiled:
+        fp32_attention_kernel<<<grid, block>>>(query, key, value,
+        output,
+                                               batch_size, num_heads,
+                                               seq_len, head_dim,
+                                               scale);
+        break;
+      case attention_strategy::untiled:
+        fp32_naive_attention_kernel<<<grid, block>>>(
+            query, key, value, output, batch_size, num_heads, seq_len,
+            head_dim);
+    }
 
   // Check for errors
   cudaError_t error = cudaGetLastError();

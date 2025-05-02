@@ -89,17 +89,18 @@ int main(int argc, char **argv) {
   cudaEventSynchronize(stop);
   cudaEventElapsedTime(&milliseconds, start, stop);
   std::cout << "Time to copy data to GPU: " << milliseconds << " ms" << std::endl;
-  //   // allocate refernce gpu memory
-  //   cudaMalloc(&d_r_q, bytes_full);
-  //   cudaMalloc(&d_r_k, bytes_full);
-  //   cudaMalloc(&d_r_v, bytes_full);
-  //   cudaMalloc(&d_r_out, bytes_full);
 
-  //   cudaMemcpy(d_r_q, h_r_query.data(), bytes_full,
-  //   cudaMemcpyHostToDevice); cudaMemcpy(d_r_k, h_r_key.data(),
-  //   bytes_full, cudaMemcpyHostToDevice); cudaMemcpy(d_r_v,
-  //   h_r_value.data(), bytes_full, cudaMemcpyHostToDevice);
-  //   cudaMemset(d_r_out, 0, bytes_full);
+  // Allocate reference GPU memory
+  cudaMalloc(&d_r_q, bytes_full);
+  cudaMalloc(&d_r_k, bytes_full);
+  cudaMalloc(&d_r_v, bytes_full);
+  cudaMalloc(&d_r_out, bytes_full);
+
+  cudaMemcpy(d_r_q, h_r_query.data(), bytes_full,
+  cudaMemcpyHostToDevice); cudaMemcpy(d_r_k, h_r_key.data(),
+  bytes_full, cudaMemcpyHostToDevice); cudaMemcpy(d_r_v,
+  h_r_value.data(), bytes_full, cudaMemcpyHostToDevice);
+  cudaMemset(d_r_out, 0, bytes_full);
 
   
   // Run GPU kernel
@@ -120,9 +121,31 @@ int main(int argc, char **argv) {
   std::cout << "Time to copy results back to CPU: " << milliseconds << " ms" << std::endl;
 
   // Run CPU reference
-  reference_attention(h_r_query.data(), h_r_key.data(), h_r_value.data(),
-                      h_out_cpu.data(), batch_size, num_heads, seq_len,
-                      head_dim);
+  // cudaEventRecord(start);
+  // reference_attention(h_r_query.data(), h_r_key.data(), h_r_value.data(),
+  //                     h_out_cpu.data(), batch_size, num_heads, seq_len,
+  //                     head_dim);
+  // cudaEventRecord(stop);
+  // cudaEventSynchronize(stop);
+  // cudaEventElapsedTime(&milliseconds, start, stop);
+  // std::cout << "Reference kernel execution time: " << milliseconds << " ms" << std::endl;
+
+  // Run GPU reference
+  cudaEventRecord(start);
+  reference_gpu_attention(
+      d_r_q, d_r_k, d_r_v,
+      d_r_out,
+      batch_size, num_heads, seq_len, head_dim,
+      attention_strategy::tiled  // or ::untiled, as you prefer
+  );
+  cudaEventRecord(stop);
+  cudaEventSynchronize(stop);
+  cudaEventElapsedTime(&milliseconds, start, stop);
+  std::cout << "Reference GPU kernel execution time: " << milliseconds << " ms" << std::endl;
+
+  // --- copy results back to host for error metrics ---
+  h_out_cpu.resize(N);
+  cudaMemcpy(h_out_cpu.data(), d_r_out, bytes_full, cudaMemcpyDeviceToHost);
 
   // Compute accuracy metrics: CosineSim, Relative L1, RMSE
   double dot = 0.0, norm_o = 0.0, norm_op = 0.0;
@@ -153,5 +176,10 @@ int main(int argc, char **argv) {
   cudaFree(d_out);
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
+
+  cudaFree(d_r_q);
+  cudaFree(d_r_k);
+  cudaFree(d_r_v);
+  cudaFree(d_r_out);
   return 0;
 }
