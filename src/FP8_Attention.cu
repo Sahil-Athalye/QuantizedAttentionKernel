@@ -637,9 +637,9 @@ void compute_quant_params_two(const half *query, const half *key,
     
     // Calculate attention scale based on actual observed values
     // Max possible Q*K value after quantization: (q_abs_max / scale_q) * (k_abs_max / scale_k) * head_dim
-    float max_qk_value = q_abs_ma * k_abs_max;
+    float max_qk_value = q_abs_max * k_abs_max;
     printf("Max Q*K value: %.4f\n", max_qk_value);
-    params.attn_scale = max_qk_value/ (fp16_max_valu*safety_factor);
+    params.attn_scale = max_qk_value/ (fp16_max_value*safety_factor);
     params.attn_scale = fmaxf(params.attn_scale, 1.0f); // Ensure attn_scale is at least 1
     
     // Set the combined scale
