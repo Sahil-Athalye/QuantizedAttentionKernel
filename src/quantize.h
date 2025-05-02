@@ -69,6 +69,7 @@ struct QuantParams {
     float scale_q;  // Scale factor for query
     float scale_k;  // Scale factor for key
     float scale_qk; // Combined scale for Q*K
+    float attn_scale; // Scale factor for attention
 };
 
 // Helper function to quantize from FP16 to FP8_E4M3
