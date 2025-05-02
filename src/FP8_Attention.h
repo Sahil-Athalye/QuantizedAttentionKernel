@@ -18,7 +18,7 @@
 #include <iomanip>
 #include "quantize.h"
 #include <random> 
-#include "../../cuda-code-repo-Sahil-Athalye/libgputk/gputk.h"
+#include "../../libgputk/gputk.h"
 
 
 // Define block size parameters - tuned for specific hardware
