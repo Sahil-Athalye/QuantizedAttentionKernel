@@ -155,7 +155,7 @@ __global__ void fp8_flash_attention_kernel(
           }
 
           // Apply scaling and dequantization
-          dot_product = dot_product * scale * quant_params.scale_qk * quant_params.attn_scale;
+          dot_product = dot_product * scale * quant_params.scale_qk * quant_params.attn_scale/(float)(BLOCK_SIZE_K);
 
           // Store in shared memory
           s_tile[ty][local_col] = __float2half(dot_product);
