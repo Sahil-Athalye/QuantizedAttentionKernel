@@ -1,5 +1,6 @@
 #include "FP8_Attention.h"
 #include "softmax.h"
+#include "quantize.h"
 
 /**
  * Main kernel for FP8 quantized attention with FlashAttention-style tiling
@@ -572,12 +573,7 @@ __global__ void findMinMax(const half* data, float* min_max_values, int size) {
     }
 }
 
-struct QuantParams {
-    float scale_q;  // Scale factor for query
-    float scale_k;  // Scale factor for key
-    float scale_qk; // Combined scale for Q*K
-    float attn_scale; // Scale factor to keep attention scores in FP16 range
-};
+
 
 /**
  * Improved function to compute quantization parameters
